@@ -15,7 +15,7 @@ import { createHttpHandler } from "../src/http-routes.mjs";
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x01, 0xff, 0xd9]); // enough to be recognisable
 
 /** A handler over a fake camera; `live` / `stored` decide how those two paths behave. */
-function setup({ live, stored, env = {}, persist = true } = {}) {
+function setup({ live, stored, env = {}, persist = true, battery = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "snap-"));
   if (persist) fs.writeFileSync(path.join(dir, "last-event-CAM1.jpg"), JPEG);
   const calls = { live: 0, stored: 0 };
@@ -43,7 +43,15 @@ function setup({ live, stored, env = {}, persist = true } = {}) {
     state,
     eventImageDir: dir,
     eventLog: () => {},
-    eufy: { async getDevice() { return { camera: () => cam }; } },
+    eufy: {
+      async getDevice() {
+        return {
+          camera: () => cam,
+          // A battery camera pays a radio wake per still; a mains one does not. The route reads this.
+          describe: () => ({ sn: "CAM1", capabilities: battery ? ["camera", "video", "battery"] : ["camera", "video"] }),
+        };
+      },
+    },
   };
   return { handler: createHttpHandler(ctx), calls };
 }
@@ -100,4 +108,28 @@ test("snapshot: SNAPSHOT_LIVE=0 answers from disk without consulting the retaine
   assert.deepEqual(out.body, JPEG);
   assert.equal(calls.live, 0);
   assert.equal(calls.stored, 0); // the disk copy is served first — no pointless round-trip per fetch
+});
+
+test("snapshot: default (auto) spares a battery camera the live burst", async () => {
+  const { handler, calls } = setup({ live: "throw", stored: "throw", battery: true });
+  const out = await get(handler);
+  assert.equal(out.code, 200);
+  assert.deepEqual(out.body, JPEG); // served from disk
+  assert.equal(calls.live, 0); // never wake a camera that runs on a battery
+});
+
+test("snapshot: default (auto) still takes a live still from a mains camera", async () => {
+  const { handler, calls } = setup({ battery: false });
+  const out = await get(handler);
+  assert.equal(out.code, 200);
+  assert.equal(out.body.toString(), "LIVE"); // free for a mains device, so take the current picture
+  assert.equal(calls.live, 1);
+});
+
+test("snapshot: SNAPSHOT_LIVE=1 forces the burst even on a battery camera", async () => {
+  const { handler, calls } = setup({ battery: true, env: { SNAPSHOT_LIVE: "1" } });
+  const out = await get(handler);
+  assert.equal(out.code, 200);
+  assert.equal(out.body.toString(), "LIVE");
+  assert.equal(calls.live, 1);
 });

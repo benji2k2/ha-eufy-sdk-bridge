@@ -92,10 +92,10 @@ export function loadConfig(env = process.env) {
     // keeps the SDK default. Mains cameras ignore it, and closing the last viewer still ends the session
     // at once. Positive whole ms; anything else → default.
     streamBatteryBudgetMs: positiveInt(env.STREAM_BATTERY_BUDGET_MS),
-    // A requester that gives up while a battery camera wakes (HA and HomeKit allow ~5s, the camera needs
-    // ~7s) retries moments later. Keep the woken session this long after its first bytes, so that retry
-    // joins a camera that is already awake instead of waking it from scratch; then release it. Only
-    // relevant while STREAM_FIRST_DATA_MS waits. 0 releases at once.
+    // A requester that gives up while a battery camera wakes (HA's first attempt errors out a couple of
+    // seconds before the camera delivers) retries moments later. Keep the woken session this long after
+    // its first bytes, so that retry joins a camera that is already awake instead of waking it from
+    // scratch; then release it. Only relevant while STREAM_FIRST_DATA_MS waits. 0 releases at once.
     streamLingerMs: env.STREAM_LINGER_MS != null ? Number(env.STREAM_LINGER_MS) : 20_000,
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it

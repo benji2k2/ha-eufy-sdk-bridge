@@ -265,9 +265,10 @@ export function createHttpHandler(ctx) {
         // Belt and braces: only treat it as a departure if the connection is really gone. A false positive
         // here would swallow every stream, so a live socket overrules the event.
         if (requesterLeft && req.socket?.destroyed !== false) {
-          // Typically HA or HomeKit, which allow ~5s where a battery camera needs ~7s, and which retry at
-          // once. The camera is awake now: hold this session for cfg.streamLingerMs so the retry joins it
-          // instead of waking the camera again, then release it. Nobody is left to answer.
+          // Seen with HA: its first attempt errors out a couple of seconds before a battery camera
+          // delivers, and it retries at once. The camera is awake now: hold this session for
+          // cfg.streamLingerMs so the retry joins it instead of waking the camera again, then release it.
+          // Nobody is left to answer.
           ctx.noteStreamOpened?.(sn); // the camera is reachable — the retry must not meet the backoff
           ctx.eventLog?.(
             `/stream ${sn} → requester left while the camera woke; holding the session ${cfg.streamLingerMs}ms for its retry`,

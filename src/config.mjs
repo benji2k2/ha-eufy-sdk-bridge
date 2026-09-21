@@ -74,6 +74,11 @@ export function loadConfig(env = process.env) {
     // Holding the response until data flows turns that race into a slow start, which consumers tolerate.
     // 0 restores the old behaviour (answer immediately).
     streamFirstDataMs: env.STREAM_FIRST_DATA_MS != null ? Number(env.STREAM_FIRST_DATA_MS) : 25_000,
+    // A requester that gives up while a battery camera wakes (HA and HomeKit allow ~5s, the camera needs
+    // ~7s) retries moments later. Keep the woken session this long after its first bytes, so that retry
+    // joins a camera that is already awake instead of waking it from scratch; then release it. Only
+    // relevant while STREAM_FIRST_DATA_MS waits. 0 releases at once.
+    streamLingerMs: env.STREAM_LINGER_MS != null ? Number(env.STREAM_LINGER_MS) : 20_000,
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's

@@ -34,6 +34,7 @@ function setup({ delayMs = 0, env = {} } = {}) {
   const state = createState();
   state.flags.ready = true;
   const noted = { opened: 0, failed: 0 };
+  const feeds = []; // every feed the route opened, so a test can see whether it was released
   const ctx = {
     ...config,
     state,
@@ -44,15 +45,27 @@ function setup({ delayMs = 0, env = {} } = {}) {
     streamBackoffMs: () => 0,
     // The seam the route offers instead of streams.mjs' per-camera client cache: no login, no network.
     streamClientFor: async () => ({
-      getDevice: async () => ({ camera: () => ({ openReadable: async () => lateFeed(delayMs) }) }),
+      getDevice: async () => ({
+        camera: () => ({
+          openReadable: async () => {
+            const feed = lateFeed(delayMs);
+            feeds.push(feed);
+            return feed;
+          },
+        }),
+      }),
     }),
     eufy: { async getDevice() { throw new Error("the stream route must not use ctx.eufy"); } },
   };
-  return { handler: createHttpHandler(ctx), noted };
+  return { handler: createHttpHandler(ctx), noted, feeds };
 }
 
-/** Run GET /stream/CAM1; capture the head, when it was written, and every byte written after it. */
-async function pull(handler) {
+/**
+ * Run GET /stream/CAM1; capture the head, when it was written, and every byte written after it.
+ * `leaveAfterMs` makes the requester hang up that long into the request, the way HA gives up on a
+ * battery camera that is still waking.
+ */
+async function pull(handler, { leaveAfterMs } = {}) {
   const out = { chunks: [] };
   const res = {
     writeHead(code, headers) { out.code = code; out.headers = headers; out.headAt = Date.now(); },
@@ -60,7 +73,14 @@ async function pull(handler) {
     end(body) { if (body) out.chunks.push(Buffer.from(body)); },
     on() {}, once() {}, emit() {}, removeListener() {}, off() {}, destroy() {},
   };
-  await handler({ url: "/stream/CAM1", headers: { host: "localhost" }, on() {} }, res);
+  const onClose = [];
+  const req = {
+    url: "/stream/CAM1",
+    headers: { host: "localhost" },
+    on(ev, fn) { if (ev === "close") onClose.push(fn); },
+  };
+  if (leaveAfterMs != null) setTimeout(() => onClose.forEach((fn) => fn()), leaveAfterMs);
+  await handler(req, res);
   return out;
 }
 
@@ -91,4 +111,32 @@ test("stream: STREAM_FIRST_DATA_MS=0 answers immediately, as it always did", asy
   assert.equal(out.code, 200);
   assert.ok(out.headAt - started < 100, "waited even though the wait is disabled");
   assert.equal(noted.opened, 1);
+});
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test("stream: a requester that leaves while the camera wakes is not answered; the session is held for a retry", async () => {
+  const { handler, noted, feeds } = setup({ delayMs: 80, env: { STREAM_LINGER_MS: "60" } });
+  const out = await pull(handler, { leaveAfterMs: 20 }); // gives up at 20ms, the camera delivers at 80ms
+  assert.equal(out.code, undefined); // nobody left to answer
+  assert.equal(noted.opened, 1); // the camera did wake: the retry must not meet the failure backoff
+  assert.equal(noted.failed, 0);
+  assert.equal(feeds[0].destroyed, false); // held, so a retry can join the awake camera
+  await sleep(100);
+  assert.equal(feeds[0].destroyed, true); // ...and released once the hold is over, never leaked
+});
+
+test("stream: STREAM_LINGER_MS=0 releases an abandoned session at once", async () => {
+  const { handler, feeds } = setup({ delayMs: 40, env: { STREAM_LINGER_MS: "0" } });
+  await pull(handler, { leaveAfterMs: 10 });
+  await sleep(10);
+  assert.equal(feeds[0].destroyed, true);
+});
+
+test("stream: a requester that stays is answered normally even with a hold configured", async () => {
+  const { handler, feeds } = setup({ delayMs: 30, env: { STREAM_LINGER_MS: "60" } });
+  const out = await pull(handler); // never hangs up
+  assert.equal(out.code, 200);
+  assert.deepEqual(out.chunks[0], FRAME);
+  assert.equal(feeds[0].destroyed, false); // streaming to its requester, not on a release timer
 });

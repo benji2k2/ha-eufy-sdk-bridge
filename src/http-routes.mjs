@@ -202,10 +202,31 @@ export function createHttpHandler(ctx) {
         const feed = await cam.openReadable(); // node Readable of Annex-B
         // A session that was merely REQUESTED is not yet a session that DELIVERS: wait for the first
         // bytes, so the consumer never sees an empty stream (see cfg.streamFirstDataMs).
+        // Watch for the requester leaving DURING the wait: the cleanup below is only attached once we
+        // answer, so without this a requester that gave up would never be noticed.
+        let waiting = true;
+        let requesterLeft = false;
+        req.on("close", () => {
+          if (waiting) requesterLeft = true;
+        });
         const head = await firstChunk(feed, cfg.streamFirstDataMs);
+        waiting = false;
         if (head === null) {
           feed.destroy();
           throw new Error(`no video data within ${cfg.streamFirstDataMs}ms (camera did not wake)`);
+        }
+        // Belt and braces: only treat it as a departure if the connection is really gone. A false positive
+        // here would swallow every stream, so a live socket overrules the event.
+        if (requesterLeft && req.socket?.destroyed !== false) {
+          // Typically HA or HomeKit, which allow ~5s where a battery camera needs ~7s, and which retry at
+          // once. The camera is awake now: hold this session for cfg.streamLingerMs so the retry joins it
+          // instead of waking the camera again, then release it. Nobody is left to answer.
+          ctx.noteStreamOpened?.(sn); // the camera is reachable — the retry must not meet the backoff
+          ctx.eventLog?.(
+            `/stream ${sn} → requester left while the camera woke; holding the session ${cfg.streamLingerMs}ms for its retry`,
+          );
+          setTimeout(() => feed.destroy(), cfg.streamLingerMs).unref?.();
+          return;
         }
         ctx.noteStreamOpened?.(sn); // reachable AND delivering → clear any failure backoff
         if (!streaming.has(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: true });

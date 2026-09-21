@@ -20,8 +20,41 @@ const GO2RTC_API_PORT = Number(process.env.GO2RTC_API_PORT) || 1984;
 // `0` disables the probe; the immediate-requester line still logs on every request.
 const STREAM_CONSUMER_LOG_MS = Number(process.env.BRIDGE_STREAM_CONSUMER_LOG_MS ?? 15000);
 
+/**
+ * Resolve with the feed's first chunk, or `null` if none arrives within `timeoutMs` (0 = don't wait).
+ * The feed is paused again right away, so the chunk we peeked at is the only one read before `pipe()`
+ * takes over — nothing is dropped and nothing is duplicated.
+ */
+function firstChunk(feed, timeoutMs) {
+  if (!timeoutMs) return Promise.resolve(undefined); // opted out: caller writes the head immediately
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      feed.off("data", onData);
+      feed.off("end", onEmpty);
+      feed.off("error", onEmpty);
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      feed.pause(); // stop the flow synchronously — pipe() resumes it after the head is written
+      finish(chunk);
+    };
+    const onEmpty = () => finish(null);
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    feed.on("data", onData);
+    feed.on("end", onEmpty);
+    feed.on("error", onEmpty);
+  });
+}
+
 export function createHttpHandler(ctx) {
   const { cfg, eufy, SCHEMA_VERSION, eventImageDir } = ctx;
+  // Per-camera P2P client for /stream. Production uses the module cache in streams.mjs; ctx may
+  // supply its own so the route can be driven without a login (tests).
+  const openStreamClient = ctx.streamClientFor ?? streamClientFor;
   const { flags } = ctx.state;
   const { streaming, idleSuspended, activeStreams, lastPullAttempt, rtspLastActive } = ctx.state;
 
@@ -163,16 +196,24 @@ export function createHttpHandler(ctx) {
       if (backoff > 0)
         return json(res, 503, { error: `stream backing off after a failed open — retry in ${Math.ceil(backoff / 1000)}s (P2P unreachable)` });
       try {
-        const client = await streamClientFor(sn, cfg); // its OWN P2P session — see streams.mjs
+        const client = await openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
         const cam = (await client.getDevice(sn)).camera?.();
         if (!cam?.openReadable) return json(res, 404, { error: "no live video on this device" });
         const feed = await cam.openReadable(); // node Readable of Annex-B
-        ctx.noteStreamOpened?.(sn); // reachable again → clear any failure backoff
+        // A session that was merely REQUESTED is not yet a session that DELIVERS: wait for the first
+        // bytes, so the consumer never sees an empty stream (see cfg.streamFirstDataMs).
+        const head = await firstChunk(feed, cfg.streamFirstDataMs);
+        if (head === null) {
+          feed.destroy();
+          throw new Error(`no video data within ${cfg.streamFirstDataMs}ms (camera did not wake)`);
+        }
+        ctx.noteStreamOpened?.(sn); // reachable AND delivering → clear any failure backoff
         if (!streaming.has(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: true });
         streaming.add(sn);
         activeStreams.set(sn, { feed, startedAt: Date.now() });
         rtspLastActive.set(sn, Date.now()); // a live stream counts as activity for the rtspStream auto-off
         res.writeHead(200, { "content-type": "video/H264", "cache-control": "no-cache" });
+        if (head) res.write(head); // the chunk we waited for, ahead of the pipe
         feed.pipe(res);
         // streaming.delete returns true only on the first cleanup for this feed → broadcast "off" once.
         const cleanup = () => {

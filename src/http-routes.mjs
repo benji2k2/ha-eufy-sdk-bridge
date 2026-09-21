@@ -4,7 +4,7 @@
 // request handler; server.mjs wraps it in http.createServer.
 import fs from "node:fs";
 import path from "node:path";
-import { streamClientFor } from "../streams.mjs";
+import { streamClientFor, dropStreamClient } from "../streams.mjs";
 
 function json(res, code, body) {
   const s = JSON.stringify(body);
@@ -20,8 +20,42 @@ const GO2RTC_API_PORT = Number(process.env.GO2RTC_API_PORT) || 1984;
 // `0` disables the probe; the immediate-requester line still logs on every request.
 const STREAM_CONSUMER_LOG_MS = Number(process.env.BRIDGE_STREAM_CONSUMER_LOG_MS ?? 15000);
 
+/**
+ * Resolve with the feed's first chunk, or `null` if none arrives within `timeoutMs` (0 = don't wait).
+ * The feed is paused again right away, so the chunk we peeked at is the only one read before `pipe()`
+ * takes over — nothing is dropped and nothing is duplicated.
+ */
+function firstChunk(feed, timeoutMs) {
+  if (!timeoutMs) return Promise.resolve(undefined); // opted out: caller writes the head immediately
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      feed.off("data", onData);
+      feed.off("end", onEmpty);
+      feed.off("error", onEmpty);
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      feed.pause(); // stop the flow synchronously — pipe() resumes it after the head is written
+      finish(chunk);
+    };
+    const onEmpty = () => finish(null);
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    feed.on("data", onData);
+    feed.on("end", onEmpty);
+    feed.on("error", onEmpty);
+  });
+}
+
 export function createHttpHandler(ctx) {
   const { cfg, eufy, SCHEMA_VERSION, eventImageDir } = ctx;
+  // Per-camera P2P client for /stream. Production uses the module cache in streams.mjs; ctx may
+  // supply its own so the route can be driven without a login (tests).
+  const openStreamClient = ctx.streamClientFor ?? streamClientFor;
+  const dropClient = ctx.dropStreamClient ?? dropStreamClient;
   const { flags } = ctx.state;
   const { streaming, idleSuspended, activeStreams, lastPullAttempt, rtspLastActive } = ctx.state;
 
@@ -87,21 +121,64 @@ export function createHttpHandler(ctx) {
     }
     if (!flags.ready) return json(res, 503, { error: "not authenticated", auth: ctx.authStatus() });
 
-    // A current still: a fresh live burst, falling back to the retained push thumbnail.
+    // A current still: a fresh live burst, falling back to the retained push thumbnail, and finally to
+    // the copy /event-image persisted on disk. That last step matters on accounts whose pushes carry no
+    // thumbnail: without it every still is a 502 after a 10-20s wake, and the caller (HA, HomeKit) then
+    // falls back to pulling video — waking the camera again for a picture we already have on disk.
     if (kind === "snapshot" && sn) {
-      try {
-        const cam = (await eufy.getDevice(sn)).camera?.();
-        if (!cam) return json(res, 404, { error: "no camera on this device" });
-        let jpeg;
+      const file = path.join(eventImageDir, `last-event-${sn}.jpg`);
+      /** Serve the persisted thumbnail. Instant, and it never touches the camera. */
+      const servePersisted = async (why) => {
         try {
-          ({ jpeg } = await cam.snapshotLive());
+          const cached = await fs.promises.readFile(file);
+          ctx.eventLog?.(`/snapshot ${sn} → 200 cached thumbnail (${cached.length}B, from disk; ${why})`);
+          res.writeHead(200, { "content-type": "image/jpeg", "content-length": cached.length });
+          res.end(cached);
+          return true;
         } catch {
-          jpeg = await cam.snapshotStored?.(); // may throw when nothing is retained
+          return false;
         }
-        if (!jpeg) return json(res, 404, { error: "no image available" });
-        res.writeHead(200, { "content-type": "image/jpeg", "content-length": jpeg.length });
-        return res.end(jpeg);
+      };
+      try {
+        const device = await eufy.getDevice(sn);
+        const cam = device.camera?.();
+        if (!cam) return json(res, 404, { error: "no camera on this device" });
+        // A battery camera pays a radio wake for every still; a mains one does not. Same test the idle
+        // watcher uses (see stream-idle.mjs), so "which cameras are expensive" is decided in one way.
+        const onBattery = (device.describe?.()?.capabilities ?? []).includes("battery");
+        const wantLive = cfg.snapshotLive === "auto" ? !onBattery : cfg.snapshotLive;
+        let jpeg;
+        let why = cfg.snapshotLive === "auto"
+          ? "battery camera — no live burst (SNAPSHOT_LIVE=auto)"
+          : "live burst disabled (SNAPSHOT_LIVE=0)";
+        if (wantLive) {
+          try {
+            ({ jpeg } = await cam.snapshotLive());
+            why = "";
+          } catch (e) {
+            why = `live burst failed: ${e?.message ?? e}`;
+          }
+        } else if (await servePersisted(why)) {
+          // No live burst wanted, and the disk copy holds the same picture the retained thumbnail would:
+          // answer from it straight away rather than paying a round-trip per fetch — on an account that
+          // retains nothing that call costs ~0.85s and never succeeds, and HA re-fetches stills on a timer.
+          return;
+        }
+        if (!jpeg) {
+          try {
+            jpeg = await cam.snapshotStored?.(); // may throw when nothing is retained
+          } catch (e) {
+            why = `${why}; nothing retained: ${e?.reason ?? e?.message ?? e}`;
+          }
+        }
+        if (jpeg) {
+          res.writeHead(200, { "content-type": "image/jpeg", "content-length": jpeg.length });
+          return res.end(jpeg);
+        }
+        if (await servePersisted(why || "no image from the camera")) return;
+        return json(res, 404, { error: "no image available", reason: why });
       } catch (e) {
+        if (await servePersisted(`snapshot failed: ${e?.message ?? e}`)) return;
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }
@@ -163,16 +240,24 @@ export function createHttpHandler(ctx) {
       if (backoff > 0)
         return json(res, 503, { error: `stream backing off after a failed open — retry in ${Math.ceil(backoff / 1000)}s (P2P unreachable)` });
       try {
-        const client = await streamClientFor(sn, cfg); // its OWN P2P session — see streams.mjs
+        const client = await openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
         const cam = (await client.getDevice(sn)).camera?.();
         if (!cam?.openReadable) return json(res, 404, { error: "no live video on this device" });
         const feed = await cam.openReadable(); // node Readable of Annex-B
-        ctx.noteStreamOpened?.(sn); // reachable again → clear any failure backoff
+        // A session that was merely REQUESTED is not yet a session that DELIVERS: wait for the first
+        // bytes, so the consumer never sees an empty stream (see cfg.streamFirstDataMs).
+        const head = await firstChunk(feed, cfg.streamFirstDataMs);
+        if (head === null) {
+          feed.destroy();
+          throw new Error(`no video data within ${cfg.streamFirstDataMs}ms (camera did not wake)`);
+        }
+        ctx.noteStreamOpened?.(sn); // reachable AND delivering → clear any failure backoff
         if (!streaming.has(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: true });
         streaming.add(sn);
         activeStreams.set(sn, { feed, startedAt: Date.now() });
         rtspLastActive.set(sn, Date.now()); // a live stream counts as activity for the rtspStream auto-off
         res.writeHead(200, { "content-type": "video/H264", "cache-control": "no-cache" });
+        if (head) res.write(head); // the chunk we waited for, ahead of the pipe
         feed.pipe(res);
         // streaming.delete returns true only on the first cleanup for this feed → broadcast "off" once.
         const cleanup = () => {
@@ -186,6 +271,7 @@ export function createHttpHandler(ctx) {
         return;
       } catch (e) {
         ctx.noteStreamFailure?.(sn); // arm backoff so the next go2rtc retry doesn't wake the radio again
+        dropClient(sn); // never reuse a session that just failed — see dropStreamClient in streams.mjs
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }

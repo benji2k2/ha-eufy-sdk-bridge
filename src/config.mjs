@@ -67,6 +67,19 @@ export function loadConfig(env = process.env) {
     // hammering consumer gets a fast 503 instead of a radio wake. Cleared on a successful open or a
     // detection. Default 30s (≈ one ffmpeg retry cycle); 0 disables.
     streamFailBackoffMs: env.STREAM_FAIL_BACKOFF_MS != null ? Number(env.STREAM_FAIL_BACKOFF_MS) : 30_000,
+    // Answer /stream only once the feed actually produces bytes. `openReadable()` resolves as soon as the
+    // P2P session is REQUESTED, but a battery camera needs ~10-20s to wake — so the consumer's ffmpeg gets
+    // a 200 with an empty body and dies with "Invalid data found when processing input" long before the
+    // first frame lands, which also arms the failure backoff and blocks the retry that would have worked.
+    // Holding the response until data flows turns that race into a slow start, which consumers tolerate.
+    // 0 restores the old behaviour (answer immediately).
+    streamFirstDataMs: env.STREAM_FIRST_DATA_MS != null ? Number(env.STREAM_FIRST_DATA_MS) : 25_000,
+    // "auto" (default): wake the camera for a still only when it is MAINS-POWERED. A mains camera
+    // answers a live burst for free; a battery one pays a radio wake for every fetch, and a host fetches
+    // stills on a timer (HA re-pulls each camera tile), so the cost is continuous. `1` forces the burst
+    // everywhere, `0` never — both remain available for hosts that want the old behaviour.
+    snapshotLive:
+      env.SNAPSHOT_LIVE == null || env.SNAPSHOT_LIVE === "auto" ? "auto" : truthy(env.SNAPSHOT_LIVE),
     // Event pre-warm: the SDK can speculatively open a camera's P2P session on a high-intent event
     // (doorbell/person/pet/package) so a following live view starts instantly. OFF by default here — it
     // holds a battery camera's radio open for ~28s per event. Set BRIDGE_PREWARM=1 to enable the SDK's

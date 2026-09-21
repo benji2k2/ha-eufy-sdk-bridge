@@ -4,7 +4,7 @@
 // request handler; server.mjs wraps it in http.createServer.
 import fs from "node:fs";
 import path from "node:path";
-import { streamClientFor } from "../streams.mjs";
+import { streamClientFor, dropStreamClient } from "../streams.mjs";
 
 function json(res, code, body) {
   const s = JSON.stringify(body);
@@ -22,6 +22,7 @@ const STREAM_CONSUMER_LOG_MS = Number(process.env.BRIDGE_STREAM_CONSUMER_LOG_MS 
 
 export function createHttpHandler(ctx) {
   const { cfg, eufy, SCHEMA_VERSION, eventImageDir } = ctx;
+  const dropClient = ctx.dropStreamClient ?? dropStreamClient;
   const { flags } = ctx.state;
   const { streaming, idleSuspended, activeStreams, lastPullAttempt, rtspLastActive } = ctx.state;
 
@@ -186,6 +187,7 @@ export function createHttpHandler(ctx) {
         return;
       } catch (e) {
         ctx.noteStreamFailure?.(sn); // arm backoff so the next go2rtc retry doesn't wake the radio again
+        dropClient(sn); // never reuse a session that just failed — see dropStreamClient in streams.mjs
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }

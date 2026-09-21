@@ -243,7 +243,10 @@ export function createHttpHandler(ctx) {
         const client = await openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
         const cam = (await client.getDevice(sn)).camera?.();
         if (!cam?.openReadable) return json(res, 404, { error: "no live video on this device" });
-        const feed = await cam.openReadable(); // node Readable of Annex-B
+        // The battery budget only takes effect when this call opens the session, which it does: the stream
+        // client is dedicated to /stream (stills go through the control client), so nothing opens it first.
+        const budget = cfg.streamBatteryBudgetMs;
+        const feed = await cam.openReadable(budget ? { batteryBudgetMs: budget } : undefined); // Annex-B
         // A session that was merely REQUESTED is not yet a session that DELIVERS: wait for the first
         // bytes, so the consumer never sees an empty stream (see cfg.streamFirstDataMs).
         const head = await firstChunk(feed, cfg.streamFirstDataMs);

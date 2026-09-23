@@ -21,6 +21,36 @@ const GO2RTC_API_PORT = Number(process.env.GO2RTC_API_PORT) || 1984;
 // `0` disables the probe; the immediate-requester line still logs on every request.
 const STREAM_CONSUMER_LOG_MS = Number(process.env.BRIDGE_STREAM_CONSUMER_LOG_MS ?? 15000);
 
+/**
+ * Resolve with the feed's first chunk, or `null` if none arrives within `timeoutMs` (0 = don't wait).
+ * The feed is paused again right away, so the chunk we peeked at is the only one read before `pipe()`
+ * takes over — nothing is dropped and nothing is duplicated.
+ */
+function firstChunk(feed, timeoutMs) {
+  if (!timeoutMs) return Promise.resolve(undefined); // opted out: caller writes the head immediately
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      feed.off("data", onData);
+      feed.off("end", onEmpty);
+      feed.off("error", onEmpty);
+      resolve(value);
+    };
+    const onData = (chunk) => {
+      feed.pause(); // stop the flow synchronously — pipe() resumes it after the head is written
+      finish(chunk);
+    };
+    const onEmpty = () => finish(null);
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    feed.on("data", onData);
+    feed.on("end", onEmpty);
+    feed.on("error", onEmpty);
+  });
+}
+
 export function createHttpHandler(ctx) {
   const { cfg, eufy, SCHEMA_VERSION, eventImageDir } = ctx;
   // Per-camera P2P client for /stream. Production uses the module cache in streams.mjs; ctx may
@@ -228,16 +258,48 @@ export function createHttpHandler(ctx) {
         // client is dedicated to /stream (stills go through the control client), so nothing opens it first.
         const budget = cfg.streamBatteryBudgetMs;
         const feed = await cam.openReadable(budget ? { batteryBudgetMs: budget } : undefined); // Annex-B
-        ctx.noteStreamOpened?.(sn); // reachable again → clear any failure backoff
+        // A session that was merely REQUESTED is not yet a session that DELIVERS: wait for the first
+        // bytes, so the consumer never sees an empty stream (see cfg.streamFirstDataMs).
+        // Watch for the requester leaving DURING the wait: the cleanup below is only attached once we
+        // answer, so without this a requester that gave up would never be noticed.
+        let waiting = true;
+        let requesterLeft = false;
+        req.on("close", () => {
+          if (waiting) requesterLeft = true;
+        });
+        const head = await firstChunk(feed, cfg.streamFirstDataMs);
+        waiting = false;
+        if (head === null) {
+          feed.destroy();
+          throw new Error(`no video data within ${cfg.streamFirstDataMs}ms (camera did not wake)`);
+        }
+        // Belt and braces: only treat it as a departure if the connection is really gone. A false positive
+        // here would swallow every stream, so a live socket overrules the event.
+        if (requesterLeft && req.socket?.destroyed !== false) {
+          // Seen with HA: its first attempt errors out a couple of seconds before a battery camera
+          // delivers, and it retries at once. The camera is awake now: hold this session for
+          // cfg.streamLingerMs so the retry joins it instead of waking the camera again, then release it.
+          // Nobody is left to answer.
+          ctx.noteStreamOpened?.(sn); // the camera is reachable — the retry must not meet the backoff
+          ctx.eventLog?.(
+            `/stream ${sn} → requester left while the camera woke; holding the session ${cfg.streamLingerMs}ms for its retry`,
+          );
+          setTimeout(() => feed.destroy(), cfg.streamLingerMs).unref?.();
+          return;
+        }
+        ctx.noteStreamOpened?.(sn); // reachable AND delivering → clear any failure backoff
         if (!streaming.has(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: true });
         streaming.add(sn);
         activeStreams.set(sn, { feed, startedAt: Date.now() });
         rtspLastActive.set(sn, Date.now()); // a live stream counts as activity for the rtspStream auto-off
         res.writeHead(200, { "content-type": "video/H264", "cache-control": "no-cache" });
-        feed.pipe(res);
         // Remember the stream's latest keyframe so the still can show what was last SEEN, not only the
-        // last event — without ever waking the camera for it (see live-still.mjs).
+        // last event — without ever waking the camera for it (see live-still.mjs). The chunk read ahead by
+        // the first-data wait goes to it too: it is usually the keyframe a session starts with.
         const still = createLiveStillTap({ sn, dir: eventImageDir, log: ctx.eventLog ?? (() => {}) });
+        if (head) still.onChunk(head);
+        if (head) res.write(head); // the chunk we waited for, ahead of the pipe
+        feed.pipe(res);
         feed.on("data", still.onChunk);
         // streaming.delete returns true only on the first cleanup for this feed → broadcast "off" once.
         const cleanup = () => {

@@ -13,10 +13,29 @@
 // which this whole file collapses to reusing the one control client.
 import { EufyMega, FileSessionStore, LoginStatus } from "@mega-yfue/eufy-sdk";
 
-// sn -> Promise<EufyMega>. The PROMISE is cached, not the finished client: two first calls for one camera
-// (e.g. an ffmpeg retry overlapping the first pull while the cold login runs) must share one login, or the
-// client cached first is overwritten and never disconnected.
+// sn -> entry. An entry wraps one client's login; callers await its `lease`. The lease is cached, not the
+// finished client: two first calls for one camera (e.g. an ffmpeg retry overlapping the first pull while the
+// cold login runs) must share one login, or the client cached first is overwritten and never disconnected.
 const clients = new Map();
+let accepting = true; // false once shutdown began — no new client may outlive closeStreamClients()
+
+const SUPERSEDED = "STREAM_CLIENT_SUPERSEDED";
+const superseded = (message) => Object.assign(new Error(message), { code: SUPERSEDED });
+
+/**
+ * True for the rejection a caller gets when its camera's client was dropped (or the bridge began shutting
+ * down) before the login it waited on had finished. Nothing was opened and the camera did not fail.
+ */
+export const isSupersededStreamClient = (e) => e?.code === SUPERSEDED;
+
+/** Best-effort disconnect, whatever disconnect() turns out to be: absent, synchronous, throwing or rejecting. */
+function disconnectQuietly(client) {
+  try {
+    return Promise.resolve(client?.disconnect?.()).catch(() => {});
+  } catch {
+    return Promise.resolve();
+  }
+}
 
 /**
  * Options for a stream-only client. Exported so the realtime opt-out is testable without a login.
@@ -41,11 +60,17 @@ export function streamClientOptions(cfg) {
 
 const createStreamClient = (cfg) => new EufyMega(streamClientOptions(cfg));
 
-/** Get (or lazily create + hydrate) the dedicated stream client for a camera. */
+/**
+ * Get (or lazily create + hydrate) the dedicated stream client for a camera. The returned promise is the
+ * caller's lease: hand it back to dropStreamClient() so a failure only ever drops the client it was about.
+ */
 export function streamClientFor(sn, cfg, create = createStreamClient) {
   const cached = clients.get(sn);
-  if (cached) return cached;
-  const pending = (async () => {
+  if (cached) return cached.lease;
+  if (!accepting) return Promise.reject(superseded(`stream client for ${sn} refused: the bridge is shutting down`));
+  let invalidate;
+  const invalidated = new Promise((_, reject) => (invalidate = reject));
+  const login = (async () => {
     const client = create(cfg);
     client.on("error", (e) => console.error(`[bridge] stream(${sn}) sdk error: ${e?.message ?? e}`));
     try {
@@ -54,16 +79,25 @@ export function streamClientFor(sn, cfg, create = createStreamClient) {
         throw new Error(`stream client for ${sn} could not hydrate session (${result.status})`);
       return client;
     } catch (e) {
-      void client.disconnect?.().catch(() => {}); // a failed login leaves nothing behind
+      void disconnectQuietly(client); // a failed login leaves nothing behind
       throw e;
     }
   })();
-  clients.set(sn, pending);
+  // Waiters follow the login unless the entry is retired first — then they are rejected at once instead of
+  // being handed a client that is already being disconnected (see retire).
+  const entry = { login, invalidate, lease: Promise.race([login, invalidated]) };
+  clients.set(sn, entry);
   // A failed login must not stay cached — but only evict our own entry, never one that replaced it.
-  pending.catch(() => {
-    if (clients.get(sn) === pending) clients.delete(sn);
+  entry.lease.catch(() => {
+    if (clients.get(sn) === entry) clients.delete(sn);
   });
-  return pending;
+  return entry.lease;
+}
+
+/** Reject an entry's pending waiters, and disconnect its client once the login settles (if it succeeds). */
+function retire(sn, entry) {
+  entry.invalidate(superseded(`stream client for ${sn} was dropped before its login finished`));
+  return entry.login.then(disconnectQuietly, () => {}); // a failed login already cleaned up after itself
 }
 
 /**
@@ -74,24 +108,26 @@ export function streamClientFor(sn, cfg, create = createStreamClient) {
  * reachable. Observed over a whole evening: the eufy app held a live view of the same camera while every
  * bridge attempt failed, and only a bridge restart (which empties this map) recovered it.
  */
-export function dropStreamClient(sn) {
-  const pending = clients.get(sn);
-  if (!pending) return false;
+export function dropStreamClient(sn, lease) {
+  const entry = clients.get(sn);
+  // With a lease, drop only the client that lease belongs to: a request that failed on an older client must
+  // not evict the one a newer request is already logging in or streaming with.
+  if (!entry || (lease !== undefined && entry.lease !== lease)) return false;
   clients.delete(sn);
-  // Best-effort; the next open builds a new one regardless. A login still in flight is disconnected once
-  // it settles (a failed one already cleaned up after itself).
-  pending.then((c) => c.disconnect?.()).catch(() => {});
+  void retire(sn, entry); // best-effort; the next open builds a new one regardless
   return true;
 }
 
 /**
- * Tear down every stream client (on shutdown). A login still in flight is disconnected once it settles,
- * but shutdown waits for that at most `waitMs` — a hanging login must not hold the process open.
+ * Tear down every stream client (on shutdown) and refuse new ones from then on. Waiters on a login still in
+ * flight are rejected; its client is disconnected once the login settles, but shutdown waits for that at
+ * most `waitMs` — a hanging login or disconnect must not hold the process open.
  */
 export async function closeStreamClients(waitMs = 2000) {
-  const pending = [...clients.values()];
+  accepting = false;
+  const entries = [...clients];
   clients.clear();
-  const closing = Promise.all(pending.map((p) => p.then((c) => c.disconnect?.()).catch(() => {})));
+  const closing = Promise.all(entries.map(([sn, entry]) => retire(sn, entry)));
   let timer;
   const bound = new Promise((r) => (timer = setTimeout(r, waitMs)));
   await Promise.race([closing, bound]);

@@ -69,12 +69,10 @@ eufy.on("error", (e) => {
   console.error(`[bridge] sdk error: ${e?.message ?? e}`);
   // A kicked/invalid cloud token surfaces as SessionExpiredError (the SDK has already cleared the
   // session) on the generic error bus. Match by name rather than `instanceof` so it still fires under a
-  // dual-package install where host and SDK hold different class objects. React immediately instead of
-  // waiting out the ~30-min poll-stall watchdog.
+  // dual-package install where host and SDK hold different class objects.
   if (e?.name === "SessionExpiredError") ctx.maybeRecoverSession();
 });
-// Push (FCM) liveness — the watchdog's poll heartbeat can't see a dead push channel (events ride push,
-// state rides poll), so track push connect/disconnect explicitly.
+// Push (FCM) liveness uses explicit transport connect/disconnect events.
 eufy.on("pushConnect", () => {
   state.flags.pushConnected = true;
   state.flags.pushSince = Date.now();

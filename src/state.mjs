@@ -14,8 +14,7 @@ export function createState() {
       // completeBoot's one-time wiring is not re-run; authStatus reflects the loss)
       lastLogin: undefined, // the most recent LoginResult (undefined until the first attempt)
       booting: false,
-      recovering: false, // a re-auth / stall recovery is in flight — blocks the watchdog racing it
-      lastActivity: Date.now(), // ms of the last poll heartbeat / realtime event (liveness clock)
+      recovering: false, // a re-auth / push recovery is in flight — blocks the watchdog racing it
       pushConnected: false,
       pushSince: Date.now(),
       go2rtcProc: undefined,

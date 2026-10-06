@@ -79,7 +79,6 @@ export function createBoot(ctx) {
     if (flags.ready || flags.booting) return;
     flags.booting = true;
     try {
-      eufy.on("deviceState", ctx.bumpActivity); // poll heartbeat — the watchdog's liveness signal
       if (DEBUG) {
         eufy.on("p2pConnect", (sn) => dbg(`p2pConnect station=${sn}`));
         eufy.on("p2pClose", (sn) => dbg(`p2pClose station=${sn}`));
@@ -87,7 +86,6 @@ export function createBoot(ctx) {
       }
       for (const e of FORWARDED_EVENTS)
         eufy.on(e, (payload) => {
-          ctx.bumpActivity();
           const detection = DETECTION_EVENTS.has(e);
           if (detection) {
             ctx.noteDetection(payload?.deviceSn);
@@ -114,7 +112,6 @@ export function createBoot(ctx) {
       const cams = await writeGo2rtcConfig(cfg, summaries);
       startGo2rtc();
       flags.ready = true;
-      flags.lastActivity = Date.now(); // start the liveness clock at boot, before the first poll
       timers.watchdog ??= setInterval(() => void ctx.watchdogTick(), 2 * 60_000);
       if (cfg.streamIdleMs) timers.streamIdle ??= setInterval(() => ctx.streamIdleTick(), 30_000);
       if (cfg.rtspIdleOffMs) timers.rtspIdle ??= setInterval(() => void ctx.rtspIdleSweep(), 60_000);

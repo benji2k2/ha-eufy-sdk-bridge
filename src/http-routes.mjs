@@ -77,7 +77,6 @@ export function createHttpHandler(ctx) {
     const [, kind, sn] = url.pathname.split("/");
 
     if (url.pathname === "/healthz") {
-      const idleSec = Math.round((Date.now() - flags.lastActivity) / 1000);
       return json(res, 200, {
         ok: true,
         schemaVersion: SCHEMA_VERSION,
@@ -86,8 +85,6 @@ export function createHttpHandler(ctx) {
         streaming: [...streaming],
         idleSuspended: [...idleSuspended], // cameras auto-off for no recent detection (awaiting next one)
         streamIdleMs: cfg.streamIdleMs, // 0 = idle auto-off disabled
-        lastActivitySec: idleSec, // seconds since the last poll heartbeat / realtime event
-        stalled: flags.ready && idleSec * 1000 >= ctx.stallThresholdMs(),
         pushConnected: flags.pushConnected, // FCM push channel — events (motion/doorbell/…) ride this
         pushIdleSec: flags.pushConnected ? 0 : Math.round((Date.now() - flags.pushSince) / 1000),
       });

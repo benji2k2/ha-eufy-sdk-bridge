@@ -436,11 +436,11 @@ Fired when a camera's live P2P feed opens (`active: true`) or is torn down / idl
 
 ## Sibling HTTP endpoints
 
-| method + path        | returns                                                                                           |
-| -------------------- | ------------------------------------------------------------------------------------------------- |
-| `GET /healthz`       | `{ ok, schemaVersion, auth: { state }, streaming: [sn,…] }` — always available (even before auth) |
-| `GET /snapshot/<sn>` | a JPEG still (`image/jpeg`). _Requires auth._                                                     |
-| `GET /stream/<sn>`   | live Annex-B H.264/H.265 (`video/H264`) — what go2rtc pulls. _Requires auth._                     |
+| method + path        | returns                                                                                                                                    |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /healthz`       | `{ ok, schemaVersion, auth: { state }, sessionLost, pushConnected, pushIdleSec, streaming: [sn,…] }` — always available (even before auth) |
+| `GET /snapshot/<sn>` | a JPEG still (`image/jpeg`). _Requires auth._                                                                                              |
+| `GET /stream/<sn>`   | live Annex-B H.264/H.265 (`video/H264`) — what go2rtc pulls. _Requires auth._                                                              |
 
 `GET /snapshot/<sn>` uses `SNAPSHOT_LIVE` when no mode is supplied. A request may use `?mode=auto` for
 the automatic battery-capability policy, `?mode=stored` to avoid live acquisition and use retained or
@@ -451,6 +451,11 @@ JPEG came from the live attempt. Invalid, empty, or duplicate `mode` parameters 
 
 go2rtc (bundled) turns `/stream/<sn>` into RTSP / WebRTC / MSE / HLS, so the frontend never speaks the
 raw video protocol.
+
+`auth` and `sessionLost` report cloud-session state. `pushConnected` and `pushIdleSec` report the FCM
+transport separately. The pinned SDK has no positive completion event for an unchanged successful poll, so
+`/healthz` does not infer poll health from device-event silence. `ok` means only that the HTTP handler
+answered; it is not aggregate cloud health.
 
 ---
 

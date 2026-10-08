@@ -4,7 +4,7 @@
 // request handler; server.mjs wraps it in http.createServer.
 import fs from "node:fs";
 import path from "node:path";
-import { streamClientFor, dropStreamClient } from "../streams.mjs";
+import { streamClientFor, dropStreamClient, isSupersededStreamClient } from "../streams.mjs";
 import { createLiveStillTap } from "./live-still.mjs";
 
 function json(res, code, body) {
@@ -265,8 +265,10 @@ export function createHttpHandler(ctx) {
         return json(res, 503, {
           error: `stream backing off after a failed open — retry in ${Math.ceil(backoff / 1000)}s (P2P unreachable)`,
         });
+      let lease;
       try {
-        const client = await openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
+        lease = openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
+        const client = await lease;
         const cam = (await client.getDevice(sn)).camera?.();
         if (!cam?.openReadable) return json(res, 404, { error: "no live video on this device" });
         // The battery budget only takes effect when this call opens the session, which it does: the stream
@@ -296,8 +298,11 @@ export function createHttpHandler(ctx) {
         feed.on("close", cleanup);
         return;
       } catch (e) {
+        // Our client was dropped (or the bridge is shutting down) before its login finished: nothing was
+        // opened and the camera did not fail, so neither arm the backoff nor drop the client that replaced it.
+        if (isSupersededStreamClient(e)) return json(res, 503, { error: String(e?.message ?? e) });
         ctx.noteStreamFailure?.(sn); // arm backoff so the next go2rtc retry doesn't wake the radio again
-        dropClient(sn); // never reuse a session that just failed — see dropStreamClient in streams.mjs
+        dropClient(sn, lease); // never reuse a session that just failed — see dropStreamClient in streams.mjs
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }

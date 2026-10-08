@@ -34,6 +34,7 @@ export function createAuth(ctx) {
   async function applyLogin(result) {
     flags.lastLogin = result;
     if (result.status === LoginStatus.Ok) {
+      eufy.forgetDevices?.(); // a fresh session rebinds command sinks: rebuild devices on next use
       await ctx.completeBoot(); // no-op once `ready` (first boot only), so re-auth never re-wires listeners
       if (flags.sessionLost) {
         // Recovered from a post-boot expiry: clear the flag and re-arm the poll under the fresh epoch.

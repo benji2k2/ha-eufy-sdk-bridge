@@ -123,6 +123,38 @@ Every device the account exposes. _(Requires `auth.state == "ok"`.)_
 - `canReboot` is `true` on HomeBase/station devices, which accept `device.reboot`.
 - A device that failed to resolve appears as `{ "sn": "…", "error": "…" }`.
 
+#### Decoded readings (additive, schema 1)
+
+Each summary also includes `decodedState`, grouped by the SDK capability accessor and then its read
+accessor. These are the values of the getters named by `dev.describe().details[].reads`, not another
+decoder or a replacement for raw `state`. For example, a camera can report:
+
+```json
+{
+  "state": { "recordingQuality": { "cur_mode": 0, "mode_0": { "quality": 2 } } },
+  "decodedState": { "camera": { "recordingQuality": 2 } }
+}
+```
+
+`device.properties` supplies `decodedProperties` metadata (below); snapshots do not repeat it. Join by capability
+`accessor` and read `accessor`; `read.property` is the SDK's flat raw-property name. Keeping both
+namespaces avoids discarding a read when multiple capabilities use the same property name.
+
+An installed read without a usable value is `null`. A read absent from the SDK manifest is omitted;
+that means the current bound surface does not expose it, not proof the hardware cannot support it.
+Values are strings, booleans or finite numbers; `false`, `0` and the empty string are retained.
+If a getter throws or returns a non-scalar, that entry is `null` and `decodedErrors` contains
+`{ capability, accessor, error }`, where `error` is `read_failed` or `non_scalar`. Exception text and
+payloads are not included. `decodedErrors` is absent on a clean read.
+
+Snapshot reads retain the SDK's normal stale-read background refresh policy; these fields do not
+promise a synchronous device confirmation or a no-refresh read. No decoded event stream is added,
+and existing event payloads are unchanged. A consumer opting into these fields must refresh its
+snapshot as appropriate; it must not overwrite decoded values with raw property payloads.
+
+Older clients can ignore the new fields and continue using `state` and `properties`. This addition
+does not by itself change Home Assistant entities or fix their displayed values.
+
 ### `device.state`
 
 The same shape as one `devices.list` entry, for a single device (identity + capabilities + live `state`). _(Requires auth.)_
@@ -159,6 +191,21 @@ _(Requires auth.)_
 Map an entry to an entity: `writable` + `bool` → **switch**, `enum` → **select** (`enumValues` = raw→label),
 `number` → **number** (`unit`/`kind` for display), everything else → **sensor**. Pair with the live value
 from `state` (same `name`).
+
+The response also includes `decodedProperties: { bound, details }`. Each detail retains the SDK's
+`capability`, `accessor` and `reads` descriptors without re-deriving types or enum labels. `bound: false`
+and empty `details` distinguish an unbound model from a bound surface with no reads. Cache this
+metadata between polls, and re-fetch after reconnecting or when the model, capabilities, or exposed
+`decodedState` accessor keys change. Evidence can install new reads during a session. Values and
+metadata are separate requests, not an atomic pair; discard metadata from a previous connection and
+leave unmatched reads unknown until refreshed. Changing scalar values does not require a new manifest.
+
+For example, the camera descriptor for recording quality has `accessor: "recordingQuality"`,
+`property: "recordingQuality"`, `type: "string"`, `kind: "enum"`, `values: [1, 2, 3]` and the SDK's
+`labels` map. **`type` describes SDK storage**, while `kind`, `values` and `labels` describe the decoded
+reading. Do not infer the decoded value's type from storage alone. `writable` describes the setter
+installed beside the read; this addition does not introduce a new write route or change write
+validation. The original flat `properties` array and its pairing with raw `state` remain unchanged.
 
 ### `device.set`
 
@@ -394,6 +441,13 @@ Fired when a camera's live P2P feed opens (`active: true`) or is torn down / idl
 | `GET /healthz`       | `{ ok, schemaVersion, auth: { state }, streaming: [sn,…] }` — always available (even before auth) |
 | `GET /snapshot/<sn>` | a JPEG still (`image/jpeg`). _Requires auth._                                                     |
 | `GET /stream/<sn>`   | live Annex-B H.264/H.265 (`video/H264`) — what go2rtc pulls. _Requires auth._                     |
+
+`GET /snapshot/<sn>` uses `SNAPSHOT_LIVE` when no mode is supplied. A request may use `?mode=auto` for
+the automatic battery-capability policy, `?mode=stored` to avoid live acquisition and use retained or
+persisted imagery, or `?mode=live` to attempt live acquisition first while retaining stored/persisted
+fallback behavior. The mode applies only to that request and does not modify `SNAPSHOT_LIVE` or other
+bridge configuration. `mode=live` is an acquisition preference, not a guarantee that the returned
+JPEG came from the live attempt. Invalid, empty, or duplicate `mode` parameters return HTTP 400.
 
 go2rtc (bundled) turns `/stream/<sn>` into RTSP / WebRTC / MSE / HLS, so the frontend never speaks the
 raw video protocol.

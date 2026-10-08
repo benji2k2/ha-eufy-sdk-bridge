@@ -122,7 +122,11 @@ export function createWsServer(ctx, httpServer) {
           return reply({ device: await ctx.describeDevice(msg.sn) });
         case "device.properties": {
           const dev = await eufy.getDevice(msg.sn);
-          return reply({ sn: msg.sn, properties: ctx.propertySpecs(dev) });
+          return reply({
+            sn: msg.sn,
+            properties: ctx.propertySpecs(dev),
+            decodedProperties: ctx.decodedProperties(dev),
+          });
         }
         case "device.set": {
           const t0 = Date.now();

@@ -1,10 +1,10 @@
 // HTTP surface: live video (go2rtc pulls /stream/<sn>), a snapshot still, the persisted last-event
-// thumbnail, and /healthz. Video is deliberately OFF the WS — connecting to /stream is what opens the
+// thumbnail, the latest detection's stored clip, and /healthz. Video is deliberately OFF the WS — connecting to /stream is what opens the
 // camera, disconnecting is what stops it, so there's no "is it streaming" flag to drift. Returns the
 // request handler; server.mjs wraps it in http.createServer.
 import fs from "node:fs";
 import path from "node:path";
-import { streamClientFor, dropStreamClient } from "../streams.mjs";
+import { streamClientFor, dropStreamClient, isSupersededStreamClient } from "../streams.mjs";
 import { createLiveStillTap } from "./live-still.mjs";
 
 function json(res, code, body) {
@@ -81,7 +81,6 @@ export function createHttpHandler(ctx) {
     const [, kind, sn] = url.pathname.split("/");
 
     if (url.pathname === "/healthz") {
-      const idleSec = Math.round((Date.now() - flags.lastActivity) / 1000);
       return json(res, 200, {
         ok: true,
         schemaVersion: SCHEMA_VERSION,
@@ -90,8 +89,6 @@ export function createHttpHandler(ctx) {
         streaming: [...streaming],
         idleSuspended: [...idleSuspended], // cameras auto-off for no recent detection (awaiting next one)
         streamIdleMs: cfg.streamIdleMs, // 0 = idle auto-off disabled
-        lastActivitySec: idleSec, // seconds since the last poll heartbeat / realtime event
-        stalled: flags.ready && idleSec * 1000 >= ctx.stallThresholdMs(),
         pushConnected: flags.pushConnected, // FCM push channel — events (motion/doorbell/…) ride this
         pushIdleSec: flags.pushConnected ? 0 : Math.round((Date.now() - flags.pushSince) / 1000),
       });
@@ -256,6 +253,17 @@ export function createHttpHandler(ctx) {
       }
     }
 
+    // The recording a HomeBase 2 stored for this camera's latest detection, as an mp4 (see clip.mjs).
+    if (kind === "clip" && sn) {
+      const clip = (await ctx.clipFor?.(sn)) ?? { status: 404, error: "clips unavailable" };
+      if (!clip.mp4) {
+        ctx.eventLog?.(`/clip ${sn} → ${clip.status} ${clip.reason ?? clip.error}`);
+        return json(res, clip.status, { error: clip.error, reason: clip.reason });
+      }
+      res.writeHead(200, { "content-type": "video/mp4", "content-length": clip.mp4.length });
+      return res.end(clip.mp4);
+    }
+
     if (kind === "stream" && sn) {
       noteStreamRequest(sn, req); // trace who is pulling this stream (incl. go2rtc's real consumers)
       if (cfg.streamIdleMs) lastPullAttempt.set(sn, Date.now()); // consumer is asking (watched vs. gone)
@@ -278,8 +286,10 @@ export function createHttpHandler(ctx) {
       let gone = false;
       const onGone = () => (gone = true);
       res.once("close", onGone);
+      let lease;
       try {
-        const client = await openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
+        lease = openStreamClient(sn, cfg); // its OWN P2P session — see streams.mjs
+        const client = await lease;
         const cam = (await client.getDevice(sn)).camera?.();
         if (!cam?.openReadable) {
           res.off("close", onGone);
@@ -336,8 +346,11 @@ export function createHttpHandler(ctx) {
         return;
       } catch (e) {
         res.off("close", onGone);
+        // Our client was dropped (or the bridge is shutting down) before its login finished: nothing was
+        // opened and the camera did not fail, so neither arm the backoff nor drop the client that replaced it.
+        if (isSupersededStreamClient(e)) return json(res, 503, { error: String(e?.message ?? e) });
         ctx.noteStreamFailure?.(sn); // arm backoff so the next go2rtc retry doesn't wake the radio again
-        dropClient(sn); // never reuse a session that just failed — see dropStreamClient in streams.mjs
+        dropClient(sn, lease); // never reuse a session that just failed — see dropStreamClient in streams.mjs
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }

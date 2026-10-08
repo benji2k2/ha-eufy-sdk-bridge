@@ -40,7 +40,6 @@ export function createAuth(ctx) {
         // Recovered from a post-boot expiry: clear the flag and re-arm the poll under the fresh epoch.
         flags.sessionLost = false;
         eufy.setPollInterval(eufy.pollIntervalMs);
-        flags.lastActivity = Date.now();
         flags.pushSince = Date.now();
       }
     }
@@ -55,12 +54,11 @@ export function createAuth(ctx) {
   /**
    * The cloud token was kicked/invalidated after boot. Surface the loss to HA at once (so it stops
    * trusting stale poll data), then try to re-login in place. A fresh login usually needs 2FA — that is
-   * broadcast as `require_2fa`, so HA can drive the re-auth immediately rather than after the 30-min
-   * poll-stall watchdog exits the process.
+   * broadcast as `require_2fa`, so HA can drive the re-auth immediately.
    */
   async function onSessionExpired() {
     flags.sessionLost = true;
-    flags.recovering = true; // also blocks the poll-stall watchdog from racing this
+    flags.recovering = true; // also blocks push recovery from racing this
     ctx.broadcast({ event: "auth", ...authStatus() });
     console.error("[bridge] cloud session expired (kicked/invalid) — re-authenticating");
     try {

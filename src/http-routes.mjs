@@ -32,7 +32,13 @@ export function createHttpHandler(ctx) {
   // Every /stream request owns its own entry. Requests for one camera overlap briefly when ffmpeg
   // reconnects before the old connection has closed, so each must release only its own; activeStreams
   // keeps showing one live entry per camera (the shape stream-idle.mjs reads) until the last one ends.
-  const openFeeds = new Map(); // sn -> Set<{ feed, startedAt }>
+  const openFeeds = new Map(); // sn -> Set<{ feed, startedAt, lease, peers }>
+  // Requests that waited on one shared login all fail with it, but the camera failed once: a lease
+  // arms the failure backoff only the first time.
+  const failedLeases = new WeakSet();
+  // A failed session is never reused, but it is not dropped under a request still streaming on it:
+  // such a lease is dropped once its last feed ends (see cleanup).
+  const dropWhenIdle = new WeakSet();
 
   // Ask go2rtc who is CONSUMING a stream (its remote address / user-agent / protocol) and log each — so
   // a stream that keeps opening "by itself" can be traced to the real viewer (an HA card, a recording,
@@ -306,9 +312,10 @@ export function createHttpHandler(ctx) {
           feed.destroy(); // detaches from the shared live source, so it can stop
           return;
         }
-        const entry = { feed, startedAt: Date.now() };
         let feeds = openFeeds.get(sn);
         if (!feeds) openFeeds.set(sn, (feeds = new Set()));
+        // `peers` lets the idle sweep close every open request for this camera, not only this one.
+        const entry = { feed, startedAt: Date.now(), lease, peers: feeds };
         feeds.add(entry);
         if (!streaming.has(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: true });
         streaming.add(sn);
@@ -331,6 +338,10 @@ export function createHttpHandler(ctx) {
           // response instead, so go2rtc reconnects right away.
           if (!feed.readableEnded) res.destroy();
           feeds.delete(entry);
+          if (dropWhenIdle.has(lease) && ![...feeds].some((other) => other.lease === lease)) {
+            dropWhenIdle.delete(lease);
+            dropClient(sn, lease); // the open that failed on this client earlier — now nobody uses it
+          }
           if (activeStreams.get(sn) === entry) {
             const other = feeds.values().next().value; // an overlapping request still streaming this camera
             if (other) activeStreams.set(sn, other);
@@ -349,8 +360,15 @@ export function createHttpHandler(ctx) {
         // Our client was dropped (or the bridge is shutting down) before its login finished: nothing was
         // opened and the camera did not fail, so neither arm the backoff nor drop the client that replaced it.
         if (isSupersededStreamClient(e)) return json(res, 503, { error: String(e?.message ?? e) });
-        ctx.noteStreamFailure?.(sn); // arm backoff so the next go2rtc retry doesn't wake the radio again
-        dropClient(sn, lease); // never reuse a session that just failed — see dropStreamClient in streams.mjs
+        // Arm backoff so the next go2rtc retry doesn't wake the radio again — once per lease.
+        if (!lease || !failedLeases.has(lease)) {
+          if (lease) failedLeases.add(lease);
+          ctx.noteStreamFailure?.(sn);
+        }
+        // Never reuse a session that just failed (see dropStreamClient in streams.mjs) — but don't pull it
+        // from under another request still streaming on it; drop it when that one ends.
+        if (lease && [...(openFeeds.get(sn) ?? [])].some((other) => other.lease === lease)) dropWhenIdle.add(lease);
+        else dropClient(sn, lease);
         return json(res, 502, { error: String(e?.message ?? e) });
       }
     }

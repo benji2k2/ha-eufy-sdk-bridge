@@ -14,6 +14,7 @@ import { PassThrough } from "node:stream";
 
 import { loadConfig } from "../src/config.mjs";
 import { createState } from "../src/state.mjs";
+import { createStreamIdle } from "../src/stream-idle.mjs";
 
 process.env.BRIDGE_STREAM_CONSUMER_LOG_MS = "0"; // no real HTTP at :1984 from the consumer probe
 const { createHttpHandler } = await import("../src/http-routes.mjs");
@@ -46,24 +47,28 @@ async function setup() {
     noteStreamFailure: (sn) => void t.failures.push(sn),
     streamBackoffMs: () => 0,
     dropStreamClient: (sn) => void t.dropped.push(sn),
-    streamClientFor: async () => {
-      if (t.clientGate) await t.clientGate;
-      return {
-        getDevice: async () => ({
-          camera: () => ({
-            openReadable: async () => {
-              t.opens++;
-              if (t.gate) await t.gate;
-              if (t.openError) throw t.openError;
-              const feed = new PassThrough();
-              t.feeds.push(feed);
-              return feed;
-            },
-          }),
-        }),
-      };
-    },
+    // `t.lease` (if set) is handed to every request, like two requests sharing one cached login.
+    streamClientFor: (sn) => t.lease ?? makeClient(sn),
   };
+  async function makeClient() {
+    if (t.clientGate) await t.clientGate;
+    return {
+      getDevice: async () => ({
+        camera: () => ({
+          openReadable: async () => {
+            t.opens++;
+            if (t.gate) await t.gate;
+            if (t.openError) throw t.openError;
+            const feed = new PassThrough();
+            t.feeds.push(feed);
+            return feed;
+          },
+        }),
+      }),
+    };
+  }
+  t.makeClient = makeClient;
+  t.ctx = ctx;
   const handler = createHttpHandler(ctx);
   const server = http.createServer((req, res) => void handler(req, res));
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
@@ -269,6 +274,72 @@ test("overlapping requests: the newer one closing first keeps the older one regi
     await settled(a);
     await until(() => !t.state.streaming.has("CAM1"), "streaming cleared");
     assert.equal(inactive(t).length, 1);
+  } finally {
+    await t.close();
+  }
+});
+
+test("the idle sweep closes every open request for the camera, not only the one it sees", async () => {
+  const t = await setup();
+  try {
+    const a = pull(t);
+    await until(() => t.feeds.length === 1, "A opened");
+    const b = pull(t); // ffmpeg reconnected before A's connection went
+    await until(() => t.feeds.length === 2, "B opened");
+    const idle = createStreamIdle({ cfg: { streamIdleMs: 1 }, state: t.state, SUSPEND_RELEASE_MS: 60_000 });
+    await new Promise((r) => setTimeout(r, 5)); // both older than the idle window
+    idle.streamIdleTick();
+    const [ra, rb] = await Promise.all([settled(a), settled(b)]);
+    assert.ok(!ra.timedOut && !rb.timedOut, "both responses closed, so go2rtc meets the suspension");
+    assert.ok(
+      t.feeds.every((f) => f.destroyed),
+      "no feed keeps the live source open",
+    );
+    assert.equal(t.state.idleSuspended.has("CAM1"), true);
+    await until(() => !t.state.streaming.has("CAM1"), "streaming cleared");
+    assert.equal(t.state.activeStreams.has("CAM1"), false);
+    assert.equal(inactive(t).length, 1, "'stopped' announced exactly once");
+  } finally {
+    await t.close();
+  }
+});
+
+test("requests that waited on one failed login arm the backoff once", async () => {
+  const t = await setup();
+  try {
+    let fail;
+    t.lease = new Promise((_, reject) => (fail = reject));
+    t.lease.catch(() => {}); // rejected below, awaited by both requests
+    const a = pull(t);
+    const b = pull(t);
+    await new Promise((r) => setTimeout(r, 50)); // both are waiting on the shared login
+    fail(new Error("login failed"));
+    const [ra, rb] = await Promise.all([settled(a), settled(b)]);
+    assert.equal(ra.status, 502);
+    assert.equal(rb.status, 502);
+    assert.deepEqual(t.failures, ["CAM1"], "one failed login is one failure, not a streak of two");
+  } finally {
+    await t.close();
+  }
+});
+
+test("a failed open does not drop the client under a request still streaming on it", async () => {
+  const t = await setup();
+  try {
+    t.lease = t.makeClient(); // both requests share this logged-in client
+    const a = pull(t);
+    await until(() => t.feeds.length === 1, "A streaming");
+    t.openError = new Error("P2P open failed");
+    const b = pull(t);
+    const rb = await settled(b);
+    assert.equal(rb.status, 502);
+    assert.deepEqual(t.failures, ["CAM1"]);
+    assert.deepEqual(t.dropped, [], "A still streams on that client");
+    assert.equal(t.state.streaming.has("CAM1"), true);
+    a.req.destroy();
+    await settled(a);
+    await until(() => t.dropped.length === 1, "dropped once A ended");
+    assert.deepEqual(t.dropped, ["CAM1"], "the failed session is not reused after all");
   } finally {
     await t.close();
   }
